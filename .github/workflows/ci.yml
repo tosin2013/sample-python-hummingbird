@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  python-build:
+    name: Python Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify Flask app imports
+        run: python -c "from src.main import app; print('Flask app loaded successfully')"
+
+      - name: Verify ML model loads
+        run: |
+          python -c "
+          from src.main import get_model
+          model, names = get_model()
+          print(f'Model loaded: {type(model).__name__}')
+          print(f'Classes: {names}')
+          "
+
+  container-build:
+    name: Container Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Buildah
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y buildah
+
+      - name: Build container image with Buildah
+        run: buildah bud -f Containerfile -t sample-python-hummingbird:latest .
+
+      - name: Inspect image
+        run: |
+          buildah images
+          IMAGE_ID=$(buildah images -q sample-python-hummingbird:latest | head -n1)
+          buildah inspect --type=image $IMAGE_ID > image-config.json
+
+          USER_ID=$(cat image-config.json | jq -r '.OCIv1.config.User // .Docker.config.User // "0"')
+          echo "Container runs as UID: $USER_ID"
+          if [ "$USER_ID" = "65532" ]; then
+            echo "Image correctly configured with non-root user (UID 65532)"
+          else
+            echo "Warning: Image user is $USER_ID, expected 65532"
+          fi
+
+      - name: Upload image config
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-config
+          path: image-config.json
+          retention-days: 7
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build container image for scanning
+        run: docker build -f Containerfile -t sample-python-hummingbird:scan .
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM with Syft
+        run: |
+          syft sample-python-hummingbird:scan -o spdx-json=sbom.spdx.json
+          syft sample-python-hummingbird:scan -o json=sbom.json
+
+      - name: Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Scan with Grype
+        run: |
+          grype sample-python-hummingbird:scan --output table --output json --file grype-report.json || true
+
+          CRITICAL=$(jq '[.matches[] | select(.vulnerability.severity == "Critical")] | length' grype-report.json)
+          HIGH=$(jq '[.matches[] | select(.vulnerability.severity == "High")] | length' grype-report.json)
+          MEDIUM=$(jq '[.matches[] | select(.vulnerability.severity == "Medium")] | length' grype-report.json)
+          LOW=$(jq '[.matches[] | select(.vulnerability.severity == "Low")] | length' grype-report.json)
+
+          echo "Vulnerability Summary:"
+          echo "  Critical: $CRITICAL"
+          echo "  High:     $HIGH"
+          echo "  Medium:   $MEDIUM"
+          echo "  Low:      $LOW"
+
+          if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+            echo ""
+            echo "FAILED: $CRITICAL critical and $HIGH high severity vulnerabilities found."
+            echo "Update dependencies to resolve these before merging."
+            exit 1
+          fi
+          echo "No critical or high vulnerabilities found."
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.spdx.json
+            sbom.json
+          retention-days: 30
+
+      - name: Upload Grype report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grype-report
+          path: grype-report.json
+          retention-days: 30
