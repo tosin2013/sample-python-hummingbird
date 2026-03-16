@@ -16,8 +16,7 @@ WORKDIR /app
 
 COPY --from=builder /opt/app-root/wheels /opt/app-root/wheels
 RUN python3 -m pip install --user --no-cache-dir --no-index \
-    --find-links=/opt/app-root/wheels /opt/app-root/wheels/* && \
-    rm -rf /opt/app-root/wheels
+    --find-links=/opt/app-root/wheels /opt/app-root/wheels/*
 
 COPY --chown=1001:1001 src/ ./src/
 COPY --chown=1001:1001 gunicorn.conf.py ./
